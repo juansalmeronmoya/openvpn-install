@@ -1,7 +1,7 @@
 #!/bin/bash
 # shellcheck disable=SC1091,SC2164,SC2034,SC1072,SC1073,SC1009
 
-# Secure OpenVPN server installer for Debian, Ubuntu, CentOS, Amazon Linux 2, Fedora and Arch Linux
+# Secure OpenVPN server installer for Debian, Ubuntu, CentOS, Amazon Linux 2, Fedora, Oracle Linux 8, Arch Linux, Rocky Linux and AlmaLinux.
 # https://github.com/angristan/openvpn-install
 
 function isRoot() {
@@ -25,7 +25,7 @@ function checkOS() {
 			if [[ $VERSION_ID -lt 9 ]]; then
 				echo "⚠️ Your version of Debian is not supported."
 				echo ""
-				echo "However, if you're using Debian >= 9 or unstable/testing then you can continue, at your own risk."
+				echo "However, if you're using Debian >= 9 or unstable/testing, you can continue at your own risk."
 				echo ""
 				until [[ $CONTINUE =~ (y|n) ]]; do
 					read -rp "Continue? [y/n]: " -e CONTINUE
@@ -40,7 +40,7 @@ function checkOS() {
 			if [[ $MAJOR_UBUNTU_VERSION -lt 16 ]]; then
 				echo "⚠️ Your version of Ubuntu is not supported."
 				echo ""
-				echo "However, if you're using Ubuntu >= 16.04 or beta, then you can continue, at your own risk."
+				echo "However, if you're using Ubuntu >= 16.04 or beta, you can continue at your own risk."
 				echo ""
 				until [[ $CONTINUE =~ (y|n) ]]; do
 					read -rp "Continue? [y/n]: " -e CONTINUE
@@ -52,25 +52,37 @@ function checkOS() {
 		fi
 	elif [[ -e /etc/system-release ]]; then
 		source /etc/os-release
-		if [[ $ID == "fedora" ]]; then
+		if [[ $ID == "fedora" || $ID_LIKE == "fedora" ]]; then
 			OS="fedora"
 		fi
-		if [[ $ID == "centos" ]]; then
+		if [[ $ID == "centos" || $ID == "rocky" || $ID == "almalinux" ]]; then
 			OS="centos"
-			if [[ ! $VERSION_ID =~ (7|8) ]]; then
+			if [[ ${VERSION_ID%.*} -lt 7 ]]; then
 				echo "⚠️ Your version of CentOS is not supported."
 				echo ""
-				echo "The script only support CentOS 7 and CentOS 8."
+				echo "The script only supports CentOS 7 and CentOS 8."
 				echo ""
 				exit 1
 			fi
 		fi
+		if [[ $ID == "ol" ]]; then
+			OS="oracle"
+			if [[ ! $VERSION_ID =~ (8) ]]; then
+				echo "Your version of Oracle Linux is not supported."
+				echo ""
+				echo "The script only supports Oracle Linux 8."
+				exit 1
+			fi
+		fi
 		if [[ $ID == "amzn" ]]; then
-			OS="amzn"
-			if [[ $VERSION_ID != "2" ]]; then
+			if [[ $VERSION_ID == "2" ]]; then
+				OS="amzn"
+			elif [[ "$(echo "$PRETTY_NAME" | cut -c 1-18)" == "Amazon Linux 2023." ]] && [[ "$(echo "$PRETTY_NAME" | cut -c 19)" -ge 6 ]]; then
+				OS="amzn2023"
+			else
 				echo "⚠️ Your version of Amazon Linux is not supported."
 				echo ""
-				echo "The script only support Amazon Linux 2."
+				echo "The script only supports Amazon Linux 2 or Amazon Linux 2023.6+"
 				echo ""
 				exit 1
 			fi
@@ -78,18 +90,18 @@ function checkOS() {
 	elif [[ -e /etc/arch-release ]]; then
 		OS=arch
 	else
-		echo "Looks like you aren't running this installer on a Debian, Ubuntu, Fedora, CentOS, Amazon Linux 2 or Arch Linux system"
+		echo "It looks like you aren't running this installer on a Debian, Ubuntu, Fedora, CentOS, Amazon Linux 2, Oracle Linux 8 or Arch Linux system."
 		exit 1
 	fi
 }
 
 function initialCheck() {
 	if ! isRoot; then
-		echo "Sorry, you need to run this as root"
+		echo "Sorry, you need to run this script as root."
 		exit 1
 	fi
 	if ! tunAvailable; then
-		echo "TUN is not available"
+		echo "TUN is not available."
 		exit 1
 	fi
 	checkOS
@@ -110,7 +122,7 @@ hide-version: yes
 use-caps-for-id: yes
 prefetch: yes' >>/etc/unbound/unbound.conf
 
-		elif [[ $OS =~ (centos|amzn) ]]; then
+		elif [[ $OS =~ (centos|amzn|oracle) ]]; then
 			yum install -y unbound
 
 			# Configuration
@@ -165,7 +177,7 @@ prefetch: yes' >>/etc/unbound/unbound.conf
 access-control: fd42:42:42:42::/112 allow' >>/etc/unbound/unbound.conf
 		fi
 
-		if [[ ! $OS =~ (fedora|centos|amzn) ]]; then
+		if [[ ! $OS =~ (fedora|centos|amzn|oracle) ]]; then
 			# DNS Rebinding fix
 			echo "private-address: 10.0.0.0/8
 private-address: fd42:42:42:42::/112
@@ -207,13 +219,52 @@ access-control: fd42:42:42:42::/112 allow' >>/etc/unbound/openvpn.conf
 	systemctl restart unbound
 }
 
+function resolvePublicIP() {
+	# IP version flags, we'll use as default the IPv4
+	CURL_IP_VERSION_FLAG="-4"
+	DIG_IP_VERSION_FLAG="-4"
+
+	# Behind NAT, we'll default to the publicly reachable IPv4/IPv6.
+	if [[ $IPV6_SUPPORT == "y" ]]; then
+		CURL_IP_VERSION_FLAG=""
+		DIG_IP_VERSION_FLAG="-6"
+	fi
+
+	# If there is no public ip yet, we'll try to solve it using: https://api.seeip.org
+	if [[ -z $PUBLIC_IP ]]; then
+		PUBLIC_IP=$(curl -f -m 5 -sS --retry 2 --retry-connrefused "$CURL_IP_VERSION_FLAG" https://api.seeip.org 2>/dev/null)
+	fi
+
+	# If there is no public ip yet, we'll try to solve it using: https://ifconfig.me
+	if [[ -z $PUBLIC_IP ]]; then
+		PUBLIC_IP=$(curl -f -m 5 -sS --retry 2 --retry-connrefused "$CURL_IP_VERSION_FLAG" https://ifconfig.me 2>/dev/null)
+	fi
+
+	# If there is no public ip yet, we'll try to solve it using: https://api.ipify.org
+	if [[ -z $PUBLIC_IP ]]; then
+		PUBLIC_IP=$(curl -f -m 5 -sS --retry 2 --retry-connrefused "$CURL_IP_VERSION_FLAG" https://api.ipify.org 2>/dev/null)
+	fi
+
+	# If there is no public ip yet, we'll try to solve it using: ns1.google.com
+	if [[ -z $PUBLIC_IP ]]; then
+		PUBLIC_IP=$(dig $DIG_IP_VERSION_FLAG TXT +short o-o.myaddr.l.google.com @ns1.google.com | tr -d '"')
+	fi
+
+	if [[ -z $PUBLIC_IP ]]; then
+		echo >&2 echo "Couldn't solve the public IP"
+		exit 1
+	fi
+
+	echo "$PUBLIC_IP"
+}
+
 function installQuestions() {
 	echo "Welcome to the OpenVPN installer!"
 	echo "The git repository is available at: https://github.com/angristan/openvpn-install"
 	echo ""
 
 	echo "I need to ask you a few questions before starting the setup."
-	echo "You can leave the default options and just press enter if you are ok with them."
+	echo "You can leave the default options and just press enter if you are okay with them."
 	echo ""
 	echo "I need to know the IPv4 address of the network interface you want OpenVPN listening to."
 	echo "Unless your server is behind NAT, it should be your public IPv4 address."
@@ -235,9 +286,12 @@ function installQuestions() {
 		echo "It seems this server is behind NAT. What is its public IPv4 address or hostname?"
 		echo "We need it for the clients to connect to the server."
 
-		PUBLICIP=$(curl -s https://api.ipify.org)
+		if [[ -z $ENDPOINT ]]; then
+			DEFAULT_ENDPOINT=$(resolvePublicIP)
+		fi
+
 		until [[ $ENDPOINT != "" ]]; do
-			read -rp "Public IPv4 address or hostname: " -e -i "$PUBLICIP" ENDPOINT
+			read -rp "Public IPv4 address or hostname: " -e -i "$DEFAULT_ENDPOINT" ENDPOINT
 		done
 	fi
 
@@ -347,7 +401,7 @@ function installQuestions() {
 		fi
 	done
 	echo ""
-	echo "Do you want to use compression? It is not recommended since the VORACLE attack make use of it."
+	echo "Do you want to use compression? It is not recommended since the VORACLE attack makes use of it."
 	until [[ $COMPRESSION_ENABLED =~ (y|n) ]]; do
 		read -rp"Enable compression? [y/n]: " -e -i n COMPRESSION_ENABLED
 	done
@@ -374,7 +428,7 @@ function installQuestions() {
 	echo ""
 	echo "Do you want to customize encryption settings?"
 	echo "Unless you know what you're doing, you should stick with the default parameters provided by the script."
-	echo "Note that whatever you choose, all the choices presented in the script are safe. (Unlike OpenVPN's defaults)"
+	echo "Note that whatever you choose, all the choices presented in the script are safe (unlike OpenVPN's defaults)."
 	echo "See https://github.com/angristan/openvpn-install#security-and-encryption to learn more."
 	echo ""
 	until [[ $CUSTOMIZE_ENC =~ (y|n) ]]; do
@@ -616,16 +670,12 @@ function installOpenVPN() {
 		PASS=${PASS:-1}
 		CONTINUE=${CONTINUE:-y}
 
-		# Behind NAT, we'll default to the publicly reachable IPv4/IPv6.
-		if [[ $IPV6_SUPPORT == "y" ]]; then
-			PUBLIC_IP=$(curl https://ifconfig.co)
-		else
-			PUBLIC_IP=$(curl -4 https://ifconfig.co)
+		if [[ -z $ENDPOINT ]]; then
+			ENDPOINT=$(resolvePublicIP)
 		fi
-		ENDPOINT=${ENDPOINT:-$PUBLIC_IP}
 	fi
 
-	# Run setup questions first, and set other variales if auto-install
+	# Run setup questions first, and set other variables if auto-install
 	installQuestions
 
 	# Get the "public" interface from the default route
@@ -637,7 +687,7 @@ function installOpenVPN() {
 	# $NIC can not be empty for script rm-openvpn-rules.sh
 	if [[ -z $NIC ]]; then
 		echo
-		echo "Can not detect public interface."
+		echo "Could not detect public interface."
 		echo "This needs for setup MASQUERADE."
 		until [[ $CONTINUE =~ (y|n) ]]; do
 			read -rp "Continue? [y/n]: " -e CONTINUE
@@ -665,9 +715,15 @@ function installOpenVPN() {
 		elif [[ $OS == 'centos' ]]; then
 			yum install -y epel-release
 			yum install -y openvpn iptables openssl wget ca-certificates curl tar 'policycoreutils-python*'
+		elif [[ $OS == 'oracle' ]]; then
+			yum install -y oracle-epel-release-el8
+			yum-config-manager --enable ol8_developer_EPEL
+			yum install -y openvpn iptables openssl wget ca-certificates curl tar policycoreutils-python-utils
 		elif [[ $OS == 'amzn' ]]; then
 			amazon-linux-extras install -y epel
 			yum install -y openvpn iptables openssl wget ca-certificates curl
+		elif [[ $OS == 'amzn2023' ]]; then
+			dnf install -y openvpn iptables openssl wget ca-certificates
 		elif [[ $OS == 'fedora' ]]; then
 			dnf install -y openvpn iptables openssl wget ca-certificates curl policycoreutils-python-utils
 		elif [[ $OS == 'arch' ]]; then
@@ -689,10 +745,10 @@ function installOpenVPN() {
 
 	# Install the latest version of easy-rsa from source, if not already installed.
 	if [[ ! -d /etc/openvpn/easy-rsa/ ]]; then
-		local version="3.0.7"
+		local version="3.1.2"
 		wget -O ~/easy-rsa.tgz https://github.com/OpenVPN/easy-rsa/releases/download/v${version}/EasyRSA-${version}.tgz
 		mkdir -p /etc/openvpn/easy-rsa
-		tar xzf ~/easy-rsa.tgz --strip-components=1 --directory /etc/openvpn/easy-rsa
+		tar xzf ~/easy-rsa.tgz --strip-components=1 --no-same-owner --directory /etc/openvpn/easy-rsa
 		rm -f ~/easy-rsa.tgz
 
 		cd /etc/openvpn/easy-rsa/ || return
@@ -712,18 +768,16 @@ function installOpenVPN() {
 		SERVER_NAME="server_$(head /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1)"
 		echo "$SERVER_NAME" >SERVER_NAME_GENERATED
 
-		echo "set_var EASYRSA_REQ_CN $SERVER_CN" >>vars
-
 		# Create the PKI, set up the CA, the DH params and the server certificate
 		./easyrsa init-pki
-		./easyrsa --batch build-ca nopass
+		EASYRSA_CA_EXPIRE=3650 ./easyrsa --batch --req-cn="$SERVER_CN" build-ca nopass
 
 		if [[ $DH_TYPE == "2" ]]; then
 			# ECDH keys are generated on-the-fly so we don't need to generate them beforehand
 			openssl dhparam -out dh.pem $DH_KEY_SIZE
 		fi
 
-		./easyrsa build-server-full "$SERVER_NAME" nopass
+		EASYRSA_CERT_EXPIRE=3650 ./easyrsa --batch build-server-full "$SERVER_NAME" nopass
 		EASYRSA_CRL_DAYS=3650 ./easyrsa gen-crl
 
 		case $TLS_SIG in
@@ -909,7 +963,7 @@ verb 3" >>/etc/openvpn/server.conf
 	fi
 
 	# Finally, restart and enable OpenVPN
-	if [[ $OS == 'arch' || $OS == 'fedora' || $OS == 'centos' ]]; then
+	if [[ $OS == 'arch' || $OS == 'fedora' || $OS == 'centos' || $OS == 'oracle' || $OS == 'amzn2023' ]]; then
 		# Don't modify package-provided service
 		cp /usr/lib/systemd/system/openvpn-server@.service /etc/systemd/system/openvpn-server@.service
 
@@ -917,10 +971,6 @@ verb 3" >>/etc/openvpn/server.conf
 		sed -i 's|LimitNPROC|#LimitNPROC|' /etc/systemd/system/openvpn-server@.service
 		# Another workaround to keep using /etc/openvpn/
 		sed -i 's|/etc/openvpn/server|/etc/openvpn|' /etc/systemd/system/openvpn-server@.service
-		# On fedora, the service hardcodes the ciphers. We want to manage the cipher ourselves, so we remove it from the service
-		if [[ $OS == "fedora" ]]; then
-			sed -i 's|--cipher AES-256-GCM --ncp-ciphers AES-256-GCM:AES-128-GCM:AES-256-CBC:AES-128-CBC:BF-CBC||' /etc/systemd/system/openvpn-server@.service
-		fi
 
 		systemctl daemon-reload
 		systemctl enable openvpn-server@server
@@ -1074,22 +1124,30 @@ function newClient() {
 		cd /etc/openvpn/easy-rsa/ || return
 		case $PASS in
 		1)
-			./easyrsa build-client-full "$CLIENT" nopass
+			EASYRSA_CERT_EXPIRE=3650 ./easyrsa --batch build-client-full "$CLIENT" nopass
 			;;
 		2)
 			echo "⚠️ You will be asked for the client password below ⚠️"
-			./easyrsa build-client-full "$CLIENT"
+			EASYRSA_CERT_EXPIRE=3650 ./easyrsa --batch build-client-full "$CLIENT"
 			;;
 		esac
 		echo "Client $CLIENT added."
 	fi
 
-	# Home directory of the user, where the client configuration (.ovpn) will be written
-	if [ -e "/home/$CLIENT" ]; then # if $1 is a user name
-		homeDir="/home/$CLIENT"
-	elif [ "${SUDO_USER}" ]; then # if not, use SUDO_USER
-		homeDir="/home/${SUDO_USER}"
-	else # if not SUDO_USER, use /root
+	# Home directory of the user, where the client configuration will be written
+	if [ -e "/home/${CLIENT}" ]; then
+		# if $1 is a user name
+		homeDir="/home/${CLIENT}"
+	elif [ "${SUDO_USER}" ]; then
+		# if not, use SUDO_USER
+		if [ "${SUDO_USER}" == "root" ]; then
+			# If running sudo as root
+			homeDir="/root"
+		else
+			homeDir="/home/${SUDO_USER}"
+		fi
+	else
+		# if not SUDO_USER, use /root
 		homeDir="/root"
 	fi
 
@@ -1108,7 +1166,7 @@ function newClient() {
 		echo "</ca>"
 
 		echo "<cert>"
-		awk '/BEGIN/,/END/' "/etc/openvpn/easy-rsa/pki/issued/$CLIENT.crt"
+		awk '/BEGIN/,/END CERTIFICATE/' "/etc/openvpn/easy-rsa/pki/issued/$CLIENT.crt"
 		echo "</cert>"
 
 		echo "<key>"
@@ -1165,6 +1223,7 @@ function revokeClient() {
 	find /home/ -maxdepth 2 -name "$CLIENT.ovpn" -delete
 	rm -f "/root/$CLIENT.ovpn"
 	sed -i "/^$CLIENT,.*/d" /etc/openvpn/ipp.txt
+	cp /etc/openvpn/easy-rsa/pki/index.txt{,.bk}
 
 	echo ""
 	echo "Certificate for client $CLIENT revoked."
@@ -1186,10 +1245,10 @@ function removeUnbound() {
 		systemctl stop unbound
 
 		if [[ $OS =~ (debian|ubuntu) ]]; then
-			apt-get autoremove --purge -y unbound
+			apt-get remove --purge -y unbound
 		elif [[ $OS == 'arch' ]]; then
 			pacman --noconfirm -R unbound
-		elif [[ $OS =~ (centos|amzn) ]]; then
+		elif [[ $OS =~ (centos|amzn|oracle) ]]; then
 			yum remove -y unbound
 		elif [[ $OS == 'fedora' ]]; then
 			dnf remove -y unbound
@@ -1215,7 +1274,7 @@ function removeOpenVPN() {
 		PROTOCOL=$(grep '^proto ' /etc/openvpn/server.conf | cut -d " " -f 2)
 
 		# Stop OpenVPN
-		if [[ $OS =~ (fedora|arch|centos) ]]; then
+		if [[ $OS =~ (fedora|arch|centos|oracle) ]]; then
 			systemctl disable openvpn-server@server
 			systemctl stop openvpn-server@server
 			# Remove customised service
@@ -1249,14 +1308,14 @@ function removeOpenVPN() {
 		fi
 
 		if [[ $OS =~ (debian|ubuntu) ]]; then
-			apt-get autoremove --purge -y openvpn
+			apt-get remove --purge -y openvpn
 			if [[ -e /etc/apt/sources.list.d/openvpn.list ]]; then
 				rm /etc/apt/sources.list.d/openvpn.list
 				apt-get update
 			fi
 		elif [[ $OS == 'arch' ]]; then
 			pacman --noconfirm -R openvpn
-		elif [[ $OS =~ (centos|amzn) ]]; then
+		elif [[ $OS =~ (centos|amzn|oracle) ]]; then
 			yum remove -y openvpn
 		elif [[ $OS == 'fedora' ]]; then
 			dnf remove -y openvpn
